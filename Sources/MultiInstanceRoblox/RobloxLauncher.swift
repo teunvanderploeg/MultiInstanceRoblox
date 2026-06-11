@@ -10,35 +10,58 @@ final class RobloxLauncher: ObservableObject {
 
     private let sourceRobloxURL = URL(fileURLWithPath: "/Applications/Roblox.app", isDirectory: true)
     private var runningApps: [UUID: NSRunningApplication] = [:]
+    private var cachedSourceVersion: String?
+    private var cloneHealthCache: [UUID: CloneHealth] = [:]
 
     func status(for profile: RobloxProfile) -> ProfileStatus {
-        if let app = runningApps[profile.id], !app.isTerminated {
-            return .running
+        if let app = runningApps[profile.id] {
+            if !app.isTerminated {
+                return .running
+            }
+            runningApps[profile.id] = nil
+            return refreshStatus(for: profile)
         }
         if let status = statuses[profile.id] {
             return status
         }
-        return computedStatus(for: profile)
+        return refreshStatus(for: profile)
     }
 
     func sourceVersion() -> String? {
-        bundleVersion(at: sourceRobloxURL)
+        cachedSourceVersion ?? refreshSourceVersion()
     }
 
-    func cloneHealth(for profile: RobloxProfile) -> CloneHealth {
+    @discardableResult
+    func refreshStatus(for profile: RobloxProfile) -> ProfileStatus {
+        let status = computedStatus(for: profile)
+        statuses[profile.id] = status
+        return status
+    }
+
+    func cloneHealth(for profile: RobloxProfile, forceRefresh: Bool = false) -> CloneHealth {
+        if !forceRefresh, let health = cloneHealthCache[profile.id] {
+            return health
+        }
+        return refreshCloneHealth(for: profile)
+    }
+
+    @discardableResult
+    func refreshCloneHealth(for profile: RobloxProfile) -> CloneHealth {
         let cloneBundle = Bundle(url: profile.cloneURL)
         let bundleIdentifier = cloneBundle?.bundleIdentifier
         let cloneVersion = bundleVersion(at: profile.cloneURL)
         let executableExists = FileManager.default.fileExists(
             atPath: profile.cloneURL.appendingPathComponent("Contents/MacOS/RobloxPlayer").path
         )
-        return CloneHealth(
+        let health = CloneHealth(
             sourceVersion: sourceVersion(),
             cloneVersion: cloneVersion,
             bundleIdentifier: bundleIdentifier,
             isSigned: isBundleSigned(profile.cloneURL),
             executableExists: executableExists
         )
+        cloneHealthCache[profile.id] = health
+        return health
     }
 
     func ensureClone(for profile: RobloxProfile, store: ProfileStore) async {
@@ -59,21 +82,23 @@ final class RobloxLauncher: ObservableObject {
 
             store.markCloneUpdated(for: profile, sourceVersion: version)
             statuses[profile.id] = .ready
+            refreshCloneHealth(for: profile)
             messages[profile.id] = "Roblox copy ready."
         } catch {
             statuses[profile.id] = .error(error.localizedDescription)
+            cloneHealthCache[profile.id] = nil
             messages[profile.id] = error.localizedDescription
         }
     }
 
     func launch(_ launchURL: URL, for profile: RobloxProfile, store: ProfileStore) async {
-        if case .ready = computedStatus(for: profile) {
+        if case .ready = status(for: profile) {
             await openLaunchURL(launchURL, for: profile)
             return
         }
 
         await ensureClone(for: profile, store: store)
-        guard case .ready = computedStatus(for: profile) else { return }
+        guard case .ready = status(for: profile) else { return }
         await openLaunchURL(launchURL, for: profile)
     }
 
@@ -100,23 +125,34 @@ final class RobloxLauncher: ObservableObject {
     func stop(_ profile: RobloxProfile) {
         guard let app = runningApps[profile.id], !app.isTerminated else {
             runningApps[profile.id] = nil
-            statuses[profile.id] = computedStatus(for: profile)
+            refreshStatus(for: profile)
             return
         }
 
         app.terminate()
         messages[profile.id] = "Stop requested."
         runningApps[profile.id] = nil
-        statuses[profile.id] = computedStatus(for: profile)
+        refreshStatus(for: profile)
     }
 
     func refreshMetrics() {
         var updated: [UUID: RunningMetric] = [:]
+        var terminatedProfileIDs: [UUID] = []
 
-        for (profileID, app) in runningApps where !app.isTerminated {
+        for (profileID, app) in runningApps {
+            guard !app.isTerminated else {
+                terminatedProfileIDs.append(profileID)
+                continue
+            }
+
             let processID = app.processIdentifier
             let metric = readMetric(for: processID)
             updated[profileID] = metric
+        }
+
+        for profileID in terminatedProfileIDs {
+            runningApps[profileID] = nil
+            statuses[profileID] = nil
         }
 
         metrics = updated
@@ -131,6 +167,7 @@ final class RobloxLauncher: ObservableObject {
         await dataStore.removeData(ofTypes: dataTypes, for: records)
 
         messages[profile.id] = "Browser session cleared. Reload the profile page to log in again."
+        refreshCloneHealth(for: profile)
     }
 
     func arrangeWindows(for profiles: [RobloxProfile], layout: WindowLayout) {
@@ -209,9 +246,15 @@ final class RobloxLauncher: ObservableObject {
         guard FileManager.default.fileExists(atPath: sourceRobloxURL.path) else {
             throw LauncherError.sourceMissing
         }
-        guard let version = sourceVersion() else {
+        guard let version = refreshSourceVersion() else {
             throw LauncherError.sourceVersionMissing
         }
+        return version
+    }
+
+    private func refreshSourceVersion() -> String? {
+        let version = bundleVersion(at: sourceRobloxURL)
+        cachedSourceVersion = version
         return version
     }
 

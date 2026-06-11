@@ -123,7 +123,6 @@ struct ContentView: View {
                         await launcher.launch(launchURL, for: profile, store: store)
                     }
                 }
-                .id(profile.id)
             }
         } else {
             ContentUnavailableView("No Profile", systemImage: "person.crop.circle.badge.questionmark")
@@ -152,7 +151,6 @@ struct ContentView: View {
                     launcher.revealFiles(for: profile)
                 }
             )
-            .id(profile.id)
 
             LauncherPanel(
                 urlText: $launcherURLText,
@@ -270,7 +268,7 @@ struct ContentView: View {
     private func exportDiagnostics() {
         let lines = store.profiles.map { profile in
             let status = launcher.status(for: profile)
-            let health = launcher.cloneHealth(for: profile)
+            let health = launcher.cloneHealth(for: profile, forceRefresh: true)
             let metric = launcher.metrics[profile.id]
             return """
             Profile: \(profile.name)

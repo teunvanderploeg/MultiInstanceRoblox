@@ -8,9 +8,12 @@ final class RobloxWebViewCache: ObservableObject {
     private var delegates: [UUID: RobloxNavigationDelegate] = [:]
     private var lastRequestedURLs: [UUID: URL] = [:]
 
-    func webView(for profile: RobloxProfile, onLaunchURL: @escaping (URL) -> Void) -> WKWebView {
+    func webView(for profile: RobloxProfile, requestedURL: URL? = nil, onLaunchURL: @escaping (URL) -> Void) -> WKWebView {
         if let webView = webViews[profile.id] {
             delegates[profile.id]?.onLaunchURL = onLaunchURL
+            if let requestedURL {
+                load(requestedURL, for: profile)
+            }
             return webView
         }
 
@@ -23,11 +26,12 @@ final class RobloxWebViewCache: ObservableObject {
         webView.navigationDelegate = delegate
         webView.allowsBackForwardNavigationGestures = true
         webView.customUserAgent = "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-        webView.load(URLRequest(url: homeURL))
 
         webViews[profile.id] = webView
         delegates[profile.id] = delegate
-        lastRequestedURLs[profile.id] = homeURL
+        let initialURL = requestedURL ?? homeURL
+        lastRequestedURLs[profile.id] = initialURL
+        webView.load(URLRequest(url: initialURL))
         return webView
     }
 
