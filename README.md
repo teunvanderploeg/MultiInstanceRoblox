@@ -2,6 +2,8 @@
 
 Native macOS utility for managing multiple Roblox profiles on Apple Silicon Macs.
 
+![MultiInstanceRoblox logo](Resources/Source/multiInstanceRobloxLogo.png)
+
 The app creates a separate managed copy of the installed Roblox app per profile, keeps a separate WebKit login session per profile, and routes `roblox:` / `roblox-player:` launch URLs to the selected profile copy.
 
 It does not store Roblox passwords, automate gameplay, patch the original `/Applications/Roblox.app`, or attempt to bypass Roblox platform checks.
