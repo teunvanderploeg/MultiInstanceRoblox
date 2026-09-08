@@ -7,365 +7,266 @@ final class RobloxLauncher: ObservableObject {
     @Published private(set) var statuses: [UUID: ProfileStatus] = [:]
     @Published private(set) var messages: [UUID: String] = [:]
     @Published private(set) var metrics: [UUID: RunningMetric] = [:]
+    @Published private(set) var operations: [UUID: String] = [:]
+    @Published private(set) var cloneHealthCache: [UUID: CloneHealth] = [:]
+    @Published private(set) var installedVersion: String?
 
-    private let sourceRobloxURL = URL(fileURLWithPath: "/Applications/Roblox.app", isDirectory: true)
-    private var runningApps: [UUID: NSRunningApplication] = [:]
-    private var cachedSourceVersion: String?
-    private var cloneHealthCache: [UUID: CloneHealth] = [:]
+    private let sourceRobloxURL: URL
+    private var runningApps: [UUID: [NSRunningApplication]] = [:]
+    private var refreshing = false
+
+    init(sourceURL: URL = URL(fileURLWithPath: "/Applications/Roblox.app", isDirectory: true)) {
+        sourceRobloxURL = sourceURL
+    }
 
     func status(for profile: RobloxProfile) -> ProfileStatus {
-        if let app = runningApps[profile.id] {
-            if !app.isTerminated {
-                return .running
+        if runningApps[profile.id]?.contains(where: { !$0.isTerminated }) == true { return .running }
+        return statuses[profile.id] ?? .missingClone
+    }
+
+    func sourceVersion() -> String? { installedVersion }
+    func isBusy(_ profile: RobloxProfile) -> Bool { operations[profile.id] != nil }
+    func cloneHealth(for profile: RobloxProfile) -> CloneHealth? { cloneHealthCache[profile.id] }
+
+    private func discoverRunningApps(_ profiles: [RobloxProfile]) {
+        let apps = NSWorkspace.shared.runningApplications
+        for profile in profiles {
+            runningApps[profile.id] = apps.filter {
+                !$0.isTerminated && $0.bundleURL?.standardizedFileURL == profile.cloneURL.standardizedFileURL
             }
-            runningApps[profile.id] = nil
-            return refreshStatus(for: profile)
         }
-        if let status = statuses[profile.id] {
-            return status
+        let ids = Set(profiles.map(\.id))
+        runningApps = runningApps.filter { ids.contains($0.key) }
+    }
+
+    /// Refresh disk state away from the main actor and reconnect to existing processes.
+    func refresh(_ profiles: [RobloxProfile], verify: Bool = false) async {
+        guard !refreshing else { return }
+        refreshing = true
+        defer { refreshing = false }
+        discoverRunningApps(profiles)
+        let source = sourceRobloxURL
+        let oldHealth = cloneHealthCache
+        let available = profiles.filter { !isBusy($0) }
+        let pids = runningApps.values.flatMap { $0.map(\.processIdentifier) }
+        let result = await Task.detached(priority: .utility) {
+            let version = RobloxWorker.version(at: source)
+            var health: [UUID: CloneHealth] = [:]
+            for profile in available {
+                let cloneVersion = RobloxWorker.version(at: profile.cloneURL)
+                if !verify, var cached = oldHealth[profile.id], cached.cloneVersion == cloneVersion {
+                    cached.sourceVersion = version
+                    health[profile.id] = cached
+                } else {
+                    health[profile.id] = RobloxWorker.health(source: source, clone: profile.cloneURL, verify: true)
+                }
+            }
+            return (version, health, RobloxWorker.metrics(for: pids))
+        }.value
+        installedVersion = result.0
+        for profile in available where !isBusy(profile) {
+            guard let health = result.1[profile.id] else { continue }
+            cloneHealthCache[profile.id] = health
+            statuses[profile.id] = Self.diskStatus(profile: profile, health: health)
         }
-        return refreshStatus(for: profile)
-    }
-
-    func sourceVersion() -> String? {
-        cachedSourceVersion ?? refreshSourceVersion()
-    }
-
-    @discardableResult
-    func refreshStatus(for profile: RobloxProfile) -> ProfileStatus {
-        let status = computedStatus(for: profile)
-        statuses[profile.id] = status
-        return status
-    }
-
-    func cloneHealth(for profile: RobloxProfile, forceRefresh: Bool = false) -> CloneHealth {
-        if !forceRefresh, let health = cloneHealthCache[profile.id] {
-            return health
+        discoverRunningApps(profiles)
+        var updated: [UUID: RunningMetric] = [:]
+        for profile in profiles {
+            let readings = (runningApps[profile.id] ?? []).compactMap { result.2[$0.processIdentifier] }
+            if let first = readings.first {
+                updated[profile.id] = RunningMetric(processID: first.processID,
+                    cpuPercent: readings.reduce(0) { $0 + $1.cpuPercent },
+                    memoryMB: readings.reduce(0) { $0 + $1.memoryMB })
+            }
         }
-        return refreshCloneHealth(for: profile)
+        metrics = updated
     }
 
-    @discardableResult
-    func refreshCloneHealth(for profile: RobloxProfile) -> CloneHealth {
-        let cloneBundle = Bundle(url: profile.cloneURL)
-        let bundleIdentifier = cloneBundle?.bundleIdentifier
-        let cloneVersion = bundleVersion(at: profile.cloneURL)
-        let executableExists = FileManager.default.fileExists(
-            atPath: profile.cloneURL.appendingPathComponent("Contents/MacOS/RobloxPlayer").path
-        )
-        let health = CloneHealth(
-            sourceVersion: sourceVersion(),
-            cloneVersion: cloneVersion,
-            bundleIdentifier: bundleIdentifier,
-            isSigned: isBundleSigned(profile.cloneURL),
-            executableExists: executableExists
-        )
-        cloneHealthCache[profile.id] = health
-        return health
+    nonisolated static func diskStatus(profile: RobloxProfile, health: CloneHealth) -> ProfileStatus {
+        guard health.cloneVersion != nil else { return .missingClone }
+        guard let source = health.sourceVersion else { return .error("Roblox is not installed at /Applications/Roblox.app") }
+        guard profile.lastSourceVersion == source, health.cloneVersion == source else {
+            return .staleClone(sourceVersion: source, cloneVersion: health.cloneVersion)
+        }
+        guard health.executableExists, health.isSigned else { return .error("The Roblox copy failed validation. Repair this profile.") }
+        return .ready
     }
 
     func ensureClone(for profile: RobloxProfile, store: ProfileStore) async {
-        messages[profile.id] = "Preparing Roblox copy..."
+        discoverRunningApps(store.profiles)
+        guard !isBusy(profile) else { return }
+        guard status(for: profile) != .running else {
+            messages[profile.id] = "Stop this profile before repairing it."
+            return
+        }
+        operations[profile.id] = "Preparing Roblox…"
+        defer { operations[profile.id] = nil }
+        _ = await prepareClone(profile, store: store)
+    }
 
+    private func prepareClone(_ profile: RobloxProfile, store: ProfileStore) async -> Bool {
+        let source = sourceRobloxURL
         do {
-            let version = try currentSourceVersion()
-            let fileManager = FileManager.default
-            try fileManager.createDirectory(at: profile.profileDirectory, withIntermediateDirectories: true)
-
-            if fileManager.fileExists(atPath: profile.cloneURL.path) {
-                try fileManager.removeItem(at: profile.cloneURL)
-            }
-
-            try fileManager.copyItem(at: sourceRobloxURL, to: profile.cloneURL)
-            try patchInfoPlist(for: profile)
-            try signBundle(at: profile.cloneURL)
-
+            let version = try await Task.detached(priority: .userInitiated) {
+                try RobloxWorker.build(source: source, profile: profile) { stage in
+                    Task { @MainActor [weak self] in
+                        guard self?.operations[profile.id] != nil else { return }
+                        self?.operations[profile.id] = stage
+                    }
+                }
+            }.value
             store.markCloneUpdated(for: profile, sourceVersion: version)
+            installedVersion = version
+            cloneHealthCache[profile.id] = await Task.detached(priority: .utility) {
+                RobloxWorker.health(source: source, clone: profile.cloneURL, verify: true)
+            }.value
             statuses[profile.id] = .ready
-            refreshCloneHealth(for: profile)
             messages[profile.id] = "Roblox copy ready."
+            return true
         } catch {
             statuses[profile.id] = .error(error.localizedDescription)
             cloneHealthCache[profile.id] = nil
             messages[profile.id] = error.localizedDescription
+            return false
         }
     }
 
-    func launch(_ launchURL: URL, for profile: RobloxProfile, store: ProfileStore) async {
-        if case .ready = status(for: profile) {
-            await openLaunchURL(launchURL, for: profile)
-            return
+    func launch(_ url: URL, for profile: RobloxProfile, store: ProfileStore) async {
+        guard LaunchURL.isNative(url) else { return }
+        guard !isBusy(profile) else { return }
+        discoverRunningApps(store.profiles)
+        operations[profile.id] = "Launching Roblox…"
+        defer { operations[profile.id] = nil }
+        // Read the installed version immediately before deciding whether to repair.
+        let source = sourceRobloxURL
+        let health = await Task.detached(priority: .utility) {
+            RobloxWorker.health(source: source, clone: profile.cloneURL, verify: true)
+        }.value
+        installedVersion = health.sourceVersion
+        cloneHealthCache[profile.id] = health
+        statuses[profile.id] = Self.diskStatus(profile: profile, health: health)
+        let action = LaunchAction.forStatus(status(for: profile))
+        if action == .prepare, !(await prepareClone(profile, store: store)) { return }
+        messages[profile.id] = "Launching Roblox…"
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.createsNewApplicationInstance = action != .reuse
+        do {
+            let app = try await NSWorkspace.shared.open([url], withApplicationAt: profile.cloneURL, configuration: configuration)
+            let existing = runningApps[profile.id] ?? []
+            runningApps[profile.id] = existing.filter { !$0.isTerminated && $0.processIdentifier != app.processIdentifier } + [app]
+            messages[profile.id] = "Launched \(profile.name)."
+        } catch {
+            messages[profile.id] = "Roblox refused launch: \(error.localizedDescription)"
         }
-
-        await ensureClone(for: profile, store: store)
-        guard case .ready = status(for: profile) else { return }
-        await openLaunchURL(launchURL, for: profile)
     }
 
-    func launch(_ launchURL: URL, for profiles: [RobloxProfile], store: ProfileStore) async {
-        for profile in profiles {
-            await launch(launchURL, for: profile, store: store)
-        }
+    func launch(_ url: URL, for profiles: [RobloxProfile], store: ProfileStore) async {
+        for profile in profiles { await launch(url, for: profile, store: store) }
     }
 
     func repairAll(_ profiles: [RobloxProfile], store: ProfileStore) async {
-        for profile in profiles {
-            if status(for: profile).needsRepair {
-                await ensureClone(for: profile, store: store)
-            }
+        await refresh(profiles, verify: true)
+        for profile in profiles where status(for: profile).needsRepair {
+            await ensureClone(for: profile, store: store)
         }
     }
 
     func stopAll(_ profiles: [RobloxProfile]) {
-        for profile in profiles {
-            stop(profile)
-        }
+        discoverRunningApps(profiles)
+        for profile in profiles { stop(profile) }
     }
 
     func stop(_ profile: RobloxProfile) {
-        guard let app = runningApps[profile.id], !app.isTerminated else {
-            runningApps[profile.id] = nil
-            refreshStatus(for: profile)
+        guard !isBusy(profile) else { return }
+        let apps = runningApps[profile.id] ?? []
+        guard !apps.isEmpty else { return }
+        let accepted = apps.filter { !$0.isTerminated }.map { $0.terminate() }
+        messages[profile.id] = accepted.allSatisfy { $0 }
+            ? "Stop requested. Waiting for Roblox to exit…"
+            : "Roblox could not be stopped. Close its window and try again."
+        // Retain process handles until their termination has actually been observed.
+    }
+
+    func clearSession(for profile: RobloxProfile, cache: RobloxWebViewCache) async {
+        guard !isBusy(profile) else { return }
+        operations[profile.id] = "Clearing browser session…"
+        defer { operations[profile.id] = nil }
+        cache.removeWebView(for: profile)
+        let dataStore = WKWebsiteDataStore(forIdentifier: profile.webDataStoreID)
+        await dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+        cache.navigate(URL(string: "https://www.roblox.com/")!, for: profile)
+        messages[profile.id] = "Browser session cleared. Log in again to continue."
+    }
+
+    func delete(_ profile: RobloxProfile, store: ProfileStore, cache: RobloxWebViewCache) async {
+        discoverRunningApps(store.profiles)
+        guard !isBusy(profile) else { return }
+        guard status(for: profile) != .running else {
+            store.errorMessage = "Stop \(profile.name) before deleting it."
             return
         }
-
-        app.terminate()
-        messages[profile.id] = "Stop requested."
-        runningApps[profile.id] = nil
-        refreshStatus(for: profile)
-    }
-
-    func refreshMetrics() {
-        var updated: [UUID: RunningMetric] = [:]
-        var terminatedProfileIDs: [UUID] = []
-
-        for (profileID, app) in runningApps {
-            guard !app.isTerminated else {
-                terminatedProfileIDs.append(profileID)
-                continue
+        operations[profile.id] = "Deleting profile…"
+        defer { operations[profile.id] = nil }
+        cache.removeWebView(for: profile)
+        // Let AppKit release any autoreleased view references before removing its store.
+        await Task.yield()
+        do {
+            try await WKWebsiteDataStore.remove(forIdentifier: profile.webDataStoreID)
+            let expectedDirectory = store.rootDirectory.appendingPathComponent("Profiles").appendingPathComponent(profile.id.uuidString)
+            guard expectedDirectory.standardizedFileURL == profile.profileDirectory.standardizedFileURL else {
+                throw WorkerError.command("The profile folder is outside its managed location. No files were deleted.")
             }
-
-            let processID = app.processIdentifier
-            let metric = readMetric(for: processID)
-            updated[profileID] = metric
+            try await Task.detached(priority: .utility) {
+                if FileManager.default.fileExists(atPath: expectedDirectory.path) {
+                    try FileManager.default.removeItem(at: expectedDirectory)
+                }
+            }.value
+            store.deleteMetadata(id: profile.id)
+            statuses[profile.id] = nil
+            messages[profile.id] = nil
+            cloneHealthCache[profile.id] = nil
+            metrics[profile.id] = nil
+            runningApps[profile.id] = nil
+        } catch {
+            store.errorMessage = "Could not finish deleting \(profile.name). The profile is kept so you can retry. \(error.localizedDescription)"
         }
-
-        for profileID in terminatedProfileIDs {
-            runningApps[profileID] = nil
-            statuses[profileID] = nil
-        }
-
-        metrics = updated
     }
 
-    func clearSession(for profile: RobloxProfile) async {
-        messages[profile.id] = "Clearing browser session..."
-
-        let dataStore = WKWebsiteDataStore(forIdentifier: profile.webDataStoreID)
-        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
-        let records = await dataStore.dataRecords(ofTypes: dataTypes)
-        await dataStore.removeData(ofTypes: dataTypes, for: records)
-
-        messages[profile.id] = "Browser session cleared. Reload the profile page to log in again."
-        refreshCloneHealth(for: profile)
-    }
-
-    func arrangeWindows(for profiles: [RobloxProfile], layout: WindowLayout) {
-        let runningProfiles = profiles.compactMap { profile -> (RobloxProfile, NSRunningApplication)? in
-            guard let app = runningApps[profile.id], !app.isTerminated else { return nil }
-            return (profile, app)
-        }
-
-        guard !runningProfiles.isEmpty else { return }
-
+    func arrangeWindows(for profiles: [RobloxProfile], layout: WindowLayout) async {
+        discoverRunningApps(profiles)
+        let apps = profiles.flatMap { runningApps[$0.id] ?? [] }
+        guard !apps.isEmpty else { return }
         let frame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let rects = layout.rects(count: runningProfiles.count, in: frame)
-
-        for (index, item) in runningProfiles.enumerated() {
-            let rect = rects[index]
-            runAppleScript(
-                """
-                tell application "System Events"
-                  set targetProcesses to every process whose unix id is \(item.1.processIdentifier)
-                  repeat with targetProcess in targetProcesses
-                    if (count of windows of targetProcess) > 0 then
-                      set position of window 1 of targetProcess to {\(Int(rect.minX)), \(Int(frame.maxY - rect.maxY))}
-                      set size of window 1 of targetProcess to {\(Int(rect.width)), \(Int(rect.height))}
-                    end if
-                  end repeat
-                end tell
-                """
-            )
+        let desktopTop = NSScreen.screens.first?.frame.maxY ?? frame.maxY
+        let rects = layout.rects(count: apps.count, in: frame)
+        let scripts = zip(apps, rects).map { app, rect in
+            """
+            tell application "System Events"
+              repeat with targetProcess in (every process whose unix id is \(app.processIdentifier))
+                if (count of windows of targetProcess) > 0 then
+                  set position of window 1 of targetProcess to {\(Int(rect.minX)), \(Int(desktopTop - rect.maxY))}
+                  set size of window 1 of targetProcess to {\(Int(rect.width)), \(Int(rect.height))}
+                end if
+              end repeat
+            end tell
+            """
+        }
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                for script in scripts { _ = try RobloxWorker.run("/usr/bin/osascript", ["-e", script], timeout: 15) }
+            }.value
+        } catch {
+            for profile in profiles {
+                messages[profile.id] = "Could not arrange windows. Check Accessibility permissions in System Settings. \(error.localizedDescription)"
+            }
         }
     }
 
     func revealFiles(for profile: RobloxProfile) {
         NSWorkspace.shared.activateFileViewerSelecting([profile.profileDirectory])
     }
-
-    private func openLaunchURL(_ launchURL: URL, for profile: RobloxProfile) async {
-        messages[profile.id] = "Launching Roblox..."
-
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        configuration.createsNewApplicationInstance = true
-
-        do {
-            let app = try await NSWorkspace.shared.open(
-                [launchURL],
-                withApplicationAt: profile.cloneURL,
-                configuration: configuration
-            )
-            runningApps[profile.id] = app
-            statuses[profile.id] = .running
-            messages[profile.id] = "Launched \(profile.name)."
-        } catch {
-            statuses[profile.id] = .error(error.localizedDescription)
-            messages[profile.id] = "Roblox refused launch: \(error.localizedDescription)"
-        }
-    }
-
-    private func computedStatus(for profile: RobloxProfile) -> ProfileStatus {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: profile.cloneURL.path) else {
-            return .missingClone
-        }
-
-        guard let sourceVersion = sourceVersion() else {
-            return .error("Roblox is not installed at /Applications/Roblox.app")
-        }
-
-        if profile.lastSourceVersion != sourceVersion {
-            return .staleClone(sourceVersion: sourceVersion, cloneVersion: profile.lastSourceVersion)
-        }
-
-        return .ready
-    }
-
-    private func currentSourceVersion() throws -> String {
-        guard FileManager.default.fileExists(atPath: sourceRobloxURL.path) else {
-            throw LauncherError.sourceMissing
-        }
-        guard let version = refreshSourceVersion() else {
-            throw LauncherError.sourceVersionMissing
-        }
-        return version
-    }
-
-    private func refreshSourceVersion() -> String? {
-        let version = bundleVersion(at: sourceRobloxURL)
-        cachedSourceVersion = version
-        return version
-    }
-
-    private func bundleVersion(at appURL: URL) -> String? {
-        guard let bundle = Bundle(url: appURL) else { return nil }
-        let shortVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
-
-        return switch (shortVersion, build) {
-        case let (.some(shortVersion), .some(build)):
-            "\(shortVersion)-\(build)"
-        case let (.some(shortVersion), .none):
-            shortVersion
-        case let (.none, .some(build)):
-            build
-        default:
-            nil
-        }
-    }
-
-    private func patchInfoPlist(for profile: RobloxProfile) throws {
-        let plistURL = profile.cloneURL.appendingPathComponent("Contents/Info.plist")
-        let data = try Data(contentsOf: plistURL)
-        var format = PropertyListSerialization.PropertyListFormat.xml
-
-        guard var plist = try PropertyListSerialization.propertyList(from: data, options: [], format: &format) as? [String: Any] else {
-            throw LauncherError.invalidInfoPlist
-        }
-
-        plist["CFBundleIdentifier"] = "dev.local.MultiInstanceRoblox.Roblox.\(profile.id.uuidString)"
-        plist["CFBundleName"] = "Roblox \(profile.name)"
-        plist["LSMultipleInstancesProhibited"] = false
-
-        let patched = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
-        try patched.write(to: plistURL, options: [.atomic])
-    }
-
-    private func signBundle(at appURL: URL) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        process.arguments = ["--force", "--deep", "--sign", "-", appURL.path]
-
-        let pipe = Pipe()
-        process.standardError = pipe
-        process.standardOutput = pipe
-
-        try process.run()
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? "codesign failed"
-            throw LauncherError.codesignFailed(output)
-        }
-    }
-
-    private func isBundleSigned(_ appURL: URL) -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        process.arguments = ["--verify", "--deep", appURL.path]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
-        } catch {
-            return false
-        }
-    }
-
-    private func readMetric(for processID: pid_t) -> RunningMetric {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-p", "\(processID)", "-o", "%cpu=,rss="]
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            let parts = output.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
-            let cpu = parts.first.flatMap { Double($0) } ?? 0
-            let rssKB = parts.dropFirst().first.flatMap { Double($0) } ?? 0
-            return RunningMetric(processID: processID, cpuPercent: cpu, memoryMB: rssKB / 1024)
-        } catch {
-            return RunningMetric(processID: processID, cpuPercent: 0, memoryMB: 0)
-        }
-    }
-
-    private func runAppleScript(_ script: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            // Window arrangement is best effort because it depends on Accessibility permission.
-        }
-    }
 }
-
 enum WindowLayout: String, CaseIterable, Identifiable {
     case grid
     case columns

@@ -156,3 +156,34 @@ extension ProfileStatus {
         }
     }
 }
+
+/// The launch decision is shared by the launcher and regression tests.
+enum LaunchAction: Equatable {
+    case reuse, open, prepare
+
+    static func forStatus(_ status: ProfileStatus) -> Self {
+        switch status {
+        case .running: .reuse
+        case .ready: .open
+        case .missingClone, .staleClone, .error: .prepare
+        }
+    }
+}
+
+enum LaunchURL {
+    static func isNative(_ url: URL) -> Bool {
+        ["roblox", "roblox-player"].contains(url.scheme?.lowercased() ?? "")
+    }
+
+    static func parse(_ text: String) -> URL? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let url = URL(string: trimmed), let scheme = url.scheme?.lowercased() {
+            guard ["https", "http", "roblox", "roblox-player"].contains(scheme) else { return nil }
+            return url
+        }
+        var components = URLComponents(string: "https://www.roblox.com/search")!
+        components.queryItems = [URLQueryItem(name: "keyword", value: trimmed)]
+        return components.url
+    }
+}

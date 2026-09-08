@@ -5,7 +5,6 @@ struct RobloxWebView: NSViewRepresentable {
     @EnvironmentObject private var cache: RobloxWebViewCache
 
     let profile: RobloxProfile
-    let requestedURL: URL?
     let onLaunchURL: (URL) -> Void
 
     func makeNSView(context: Context) -> WebViewHost {
@@ -19,7 +18,7 @@ struct RobloxWebView: NSViewRepresentable {
     }
 
     private func updateHost(_ host: WebViewHost, context: Context) {
-        let webView = cache.webView(for: profile, requestedURL: requestedURL, onLaunchURL: onLaunchURL)
+        let webView = cache.webView(for: profile, onLaunchURL: onLaunchURL)
         host.setWebView(webView, profileID: profile.id)
     }
 }

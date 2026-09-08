@@ -14,6 +14,7 @@ let package = Package(
         .executableTarget(
             name: "MultiInstanceRoblox",
             path: "Sources/MultiInstanceRoblox"
-        )
+        ),
+        .testTarget(name: "MultiInstanceRobloxTests", dependencies: ["MultiInstanceRoblox"])
     ]
 )

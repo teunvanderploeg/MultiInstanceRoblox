@@ -59,3 +59,57 @@ Window arrangement uses macOS Accessibility automation through System Events. If
 ```text
 System Settings -> Privacy & Security -> Accessibility
 ```
+
+## Recovery and repairs
+
+If `profiles.json` cannot be read, the app preserves it and shows recovery options.
+You can restore `profiles.backup.json` or start fresh. Both actions first keep a
+separate `profiles.unreadable-<UUID>.json` copy of the original file. The backup
+contains the previous successfully saved profile metadata, not a copy of browser
+sessions or Roblox apps.
+
+Repairs copy Roblox into a temporary folder, patch and sign that copy, and verify
+it before replacing the existing profile copy. If installing the replacement
+fails, the app attempts to restore the old copy. Stop a running profile before
+repairing or deleting it. Preparation and process checks run off the UI thread,
+and a profile accepts only one launch, repair, or data-cleanup operation at a time.
+
+The manager checks the installed Roblox version every three seconds, reconnects
+to already running managed copies when opened, and tracks Stop requests until
+the processes actually exit. Launching a running profile routes the link to its
+existing app instance.
+
+## Browser and profile controls
+
+Use Back, Forward, Reload, and Home above the browser. Opening the same URL again
+navigates again. Page failures show a Retry button. Web pages are saved in Recent;
+native launch links are not added to history because they are session-specific.
+
+The profile-details button opens the inspector for names, icons, colors, notes,
+clone health, repair, session clearing, and deletion. The menu beside the launcher
+contains bulk repair, Stop All, window arrangements, and diagnostics export.
+Reordering is disabled while filtering profiles to avoid moving unrelated rows.
+Deleting a profile removes its cached browser, persistent WebKit store, and managed
+Roblox copy. If cleanup fails, the profile stays available so deletion can be retried.
+
+## Tests
+
+```sh
+swift test
+```
+
+Regression tests use temporary directories and browser doubles. They cover corrupt
+profile recovery, backup restoration, preservation of edits during repair, safe
+replacement and rollback, launch decisions, installed-version refresh, URL parsing,
+repeated navigation, and browser-cache cleanup. They do not launch Roblox or use
+saved accounts.
+
+For an isolated UI check, debug builds support:
+
+```sh
+swift run MultiInstanceRoblox --preview
+```
+
+Preview uses new temporary profiles, nonpersistent browser sessions, and a blank
+home page. The flag is available only in debug builds. Live sign-in, game launches,
+and Accessibility window arrangement still need manual checks on a Mac.

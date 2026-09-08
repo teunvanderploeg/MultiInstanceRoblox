@@ -5,305 +5,346 @@ struct ContentView: View {
     @EnvironmentObject private var store: ProfileStore
     @EnvironmentObject private var launcher: RobloxLauncher
     @EnvironmentObject private var webViewCache: RobloxWebViewCache
-
     @State private var launcherURLText = ""
-    @State private var requestedURLs: [UUID: URL] = [:]
-    @State private var layout: WindowLayout = .grid
     @State private var searchText = ""
     @State private var diagnosticsMessage = ""
-
+    @State private var showInspector = false
+    @State private var deletingProfile: RobloxProfile?
+    @State private var clearingProfile: RobloxProfile?
     private let metricsTimer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationSplitView {
             sidebar
         } detail: {
-            detail
-        }
-        .onReceive(metricsTimer) { _ in
-            launcher.refreshMetrics()
-        }
-        .alert("Profile Error", isPresented: errorBinding) {
-            Button("OK", role: .cancel) {
-                store.errorMessage = nil
+            if store.needsRecovery {
+                recoveryView
+            } else if let profile = store.selectedProfile {
+                profileWorkspace(profile)
+            } else {
+                ContentUnavailableView {
+                    Label("No profiles", systemImage: "person.crop.circle.badge.plus")
+                } description: {
+                    Text("Add a profile to log in to Roblox.")
+                } actions: {
+                    Button("Add profile") { store.addProfile() }
+                }
             }
-        } message: {
-            Text(store.errorMessage ?? "")
+        }
+        .inspector(isPresented: $showInspector) {
+            if let profile = store.selectedProfile, !store.needsRecovery {
+                profileInspector(profile)
+                    .inspectorColumnWidth(min: 280, ideal: 310, max: 380)
+            }
+        }
+        .task(id: store.profiles.map(\.id)) { await launcher.refresh(store.profiles) }
+        .onReceive(metricsTimer) { _ in Task { await launcher.refresh(store.profiles) } }
+        .alert("Profile error", isPresented: Binding(
+            get: { store.errorMessage != nil && !store.needsRecovery },
+            set: { if !$0 { store.errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { store.errorMessage = nil }
+        } message: { Text(store.errorMessage ?? "") }
+        .confirmationDialog("Delete \(deletingProfile?.name ?? "profile") and its saved login?", isPresented: Binding(
+            get: { deletingProfile != nil }, set: { if !$0 { deletingProfile = nil } }
+        ), titleVisibility: .visible) {
+            if let profile = deletingProfile {
+                Button("Delete profile", role: .destructive) {
+                    Task { await launcher.delete(profile, store: store, cache: webViewCache) }
+                }
+            }
+        }
+        .confirmationDialog("Clear the saved login for \(clearingProfile?.name ?? "profile")?", isPresented: Binding(
+            get: { clearingProfile != nil }, set: { if !$0 { clearingProfile = nil } }
+        ), titleVisibility: .visible) {
+            if let profile = clearingProfile {
+                Button("Clear session", role: .destructive) {
+                    Task { await launcher.clearSession(for: profile, cache: webViewCache) }
+                }
+            }
         }
     }
 
     private var sidebar: some View {
         VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Search profiles", text: $searchText)
-                    .textFieldStyle(.plain)
-            }
-            .padding(10)
-
+            TextField("Search profiles", text: $searchText)
+                .textFieldStyle(.roundedBorder).padding(10)
             List(selection: $store.selectedProfileID) {
                 ForEach(filteredProfiles) { profile in
-                    ProfileRow(
-                        profile: profile,
-                        status: launcher.status(for: profile),
-                        metric: launcher.metrics[profile.id],
+                    ProfileRow(profile: profile, status: launcher.status(for: profile), metric: launcher.metrics[profile.id],
                         isSelectedForBulkLaunch: Binding(
-                            get: { currentProfile(profile.id)?.isSelectedForBulkLaunch ?? profile.isSelectedForBulkLaunch },
-                            set: { store.setBulkSelection(profile, isSelected: $0) }
-                        )
-                    )
-                    .tag(profile.id)
-                    .contextMenu {
-                        Button("Duplicate") {
-                            store.duplicate(profile)
+                            get: { store.profiles.first { $0.id == profile.id }?.isSelectedForBulkLaunch ?? false },
+                            set: { value in store.update(id: profile.id) { $0.isSelectedForBulkLaunch = value } }
+                        ))
+                        .tag(profile.id)
+                        .contextMenu {
+                            Button("Duplicate") { store.duplicate(profile) }
+                            Button("Reveal files") { launcher.revealFiles(for: profile) }
+                            Button("Delete…", role: .destructive) { deletingProfile = profile }
+                                .disabled(launcher.isBusy(profile) || launcher.status(for: profile) == .running)
                         }
-                        Button("Reveal Files") {
-                            launcher.revealFiles(for: profile)
-                        }
-                        Button("Delete", role: .destructive) {
-                            store.delete(profile)
-                        }
-                    }
                 }
-                .onMove(perform: store.moveProfiles)
+                .onMove { source, destination in
+                    // Filtered offsets do not identify the same rows in the full array.
+                    if searchText.isEmpty { store.moveProfiles(from: source, to: destination) }
+                }
+                .moveDisabled(!searchText.isEmpty)
             }
-
             HStack {
-                Button {
-                    store.addProfile()
-                } label: {
-                    Label("Add", systemImage: "plus")
-                }
-
-                Button {
-                    if let profile = store.selectedProfile {
-                        store.duplicate(profile)
-                    }
-                } label: {
-                    Label("Duplicate", systemImage: "plus.square.on.square")
-                }
-                .disabled(store.selectedProfile == nil)
-
+                Button { store.addProfile() } label: { Label("Add", systemImage: "plus") }
                 Spacer()
+                Menu {
+                    Button("Select all") { store.selectAllForBulkLaunch(true) }
+                    Button("Deselect all") { store.selectAllForBulkLaunch(false) }
+                } label: { Image(systemName: "checklist") }
+                    .menuStyle(.borderlessButton).fixedSize().help("Bulk selection")
+            }.padding(12)
+        }
+        .disabled(store.needsRecovery)
+        .navigationSplitViewColumnWidth(min: 220, ideal: 250)
+    }
 
-                Button {
-                    store.selectAllForBulkLaunch(true)
-                } label: {
-                    Image(systemName: "checkmark.circle")
+    private func profileWorkspace(_ profile: RobloxProfile) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: profile.symbolName).foregroundStyle(profile.displayColor)
+                Text(profile.name).font(.headline).lineLimit(1)
+                StatusBadge(status: launcher.status(for: profile))
+                if let metric = launcher.metrics[profile.id] {
+                    Text("CPU \(metric.cpuPercent, specifier: "%.1f")% · \(Int(metric.memoryMB)) MB")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
-                .help("Select all for bulk launch")
-
-                Button {
-                    store.selectAllForBulkLaunch(false)
-                } label: {
-                    Image(systemName: "circle")
+                Spacer()
+                if launcher.status(for: profile) == .running {
+                    Button("Stop", systemImage: "stop.fill") { launcher.stop(profile) }
+                        .disabled(launcher.isBusy(profile))
                 }
-                .help("Clear bulk launch selection")
+                Button("Profile details", systemImage: "sidebar.right") { showInspector.toggle() }
+                    .labelStyle(.iconOnly).help("Profile details and maintenance")
+            }.padding(.horizontal, 12).padding(.top, 10)
+            launcherControls(profile).padding(12)
+            if let operation = launcher.operations[profile.id] {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(operation).font(.caption)
+                    Spacer()
+                }.padding(.horizontal, 12).padding(.bottom, 8)
+            } else if let message = launcher.messages[profile.id] {
+                Text(message).font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.bottom, 8).textSelection(.enabled)
             }
-            .padding(12)
+            Divider()
+            if launcher.operations[profile.id] == "Clearing browser session…" || launcher.operations[profile.id] == "Deleting profile…" {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                BrowserPane(profile: profile, state: webViewCache.state(for: profile)) { url in
+                    Task { await launcher.launch(url, for: profile, store: store) }
+                }
+                .id(profile.id)
+            }
         }
-        .navigationSplitViewColumnWidth(min: 270, ideal: 310)
     }
 
-    @ViewBuilder
-    private var detail: some View {
-        if let profile = store.selectedProfile {
-            VStack(spacing: 0) {
-                topControls(for: profile)
-
-                Divider()
-
-                RobloxWebView(
-                    profile: profile,
-                    requestedURL: requestedURLs[profile.id]
-                ) { launchURL in
-                    store.recordRecentURL(launchURL.absoluteString, for: profile)
-                    Task {
-                        await launcher.launch(launchURL, for: profile, store: store)
+    private func launcherControls(_ profile: RobloxProfile) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                TextField("Game URL or search Roblox", text: $launcherURLText)
+                    .textFieldStyle(.roundedBorder).onSubmit { openCurrent(profile) }
+                Button("Open") { openCurrent(profile) }.disabled(launcher.isBusy(profile))
+                Button("Launch \(selectedBulkProfiles.count)", systemImage: "play.fill") {
+                    Task { await launchSelected() }
+                }
+                .disabled(selectedBulkProfiles.isEmpty || selectedBulkProfiles.contains { launcher.isBusy($0) })
+                Button("Favorite", systemImage: "star") {
+                    if let url = LaunchURL.parse(launcherURLText), !LaunchURL.isNative(url) {
+                        store.addFavoriteURL(url.absoluteString, to: profile)
+                    }
+                }.labelStyle(.iconOnly).help("Save this game page to favorites")
+                Menu {
+                    Button("Repair all") { Task { await launcher.repairAll(store.profiles, store: store) } }
+                    Button("Stop all") { launcher.stopAll(store.profiles) }
+                    Divider()
+                    ForEach(WindowLayout.allCases) { layout in
+                        Button("Arrange: \(layout.label)") {
+                            Task { await launcher.arrangeWindows(for: store.profiles, layout: layout) }
+                        }
+                    }
+                    Divider()
+                    Button("Export diagnostics") { Task { await exportDiagnostics() } }
+                } label: { Image(systemName: "ellipsis.circle") }
+                    .menuStyle(.borderlessButton).fixedSize().help("Maintenance and window arrangement")
+            }
+            if !profile.favoriteGameURLs.isEmpty || !profile.recentGameURLs.isEmpty {
+                HStack(alignment: .top, spacing: 12) {
+                    if !profile.favoriteGameURLs.isEmpty {
+                        URLList(title: "Favorites", urls: profile.favoriteGameURLs,
+                            choose: { launcherURLText = $0; openCurrent(profile) },
+                            remove: { store.removeFavoriteURL($0, from: profile) })
+                    }
+                    if !profile.recentGameURLs.isEmpty {
+                        URLList(title: "Recent", urls: profile.recentGameURLs,
+                            choose: { launcherURLText = $0; openCurrent(profile) }, remove: nil)
                     }
                 }
             }
-        } else {
-            ContentUnavailableView("No Profile", systemImage: "person.crop.circle.badge.questionmark")
+            if !diagnosticsMessage.isEmpty {
+                Text(diagnosticsMessage).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
         }
     }
 
-    private func topControls(for profile: RobloxProfile) -> some View {
-        VStack(spacing: 12) {
-            ProfileHeader(
-                profile: profile,
-                status: launcher.status(for: profile),
-                message: launcher.messages[profile.id],
-                metric: launcher.metrics[profile.id],
-                rename: { store.rename(id: profile.id, to: $0) },
-                setColor: { store.setColor(id: profile.id, colorName: $0) },
-                setSymbol: { store.setSymbol(id: profile.id, symbolName: $0) },
-                repair: {
-                    Task {
-                        await launcher.ensureClone(for: profile, store: store)
-                    }
-                },
-                stop: {
-                    launcher.stop(profile)
-                },
-                reveal: {
-                    launcher.revealFiles(for: profile)
+    private func profileInspector(_ profile: RobloxProfile) -> some View {
+        Form {
+            Section("Profile") {
+                TextField("Name", text: profileBinding(profile.id, \.name, fallback: profile.name))
+                Picker("Icon", selection: profileBinding(profile.id, \.symbolName, fallback: profile.symbolName)) {
+                    ForEach(ProfileIcon.symbols, id: \.self) { symbol in Label(symbol, systemImage: symbol).tag(symbol) }
                 }
-            )
-
-            LauncherPanel(
-                urlText: $launcherURLText,
-                layout: $layout,
-                selectedCount: selectedBulkProfiles.count,
-                recentURLs: profile.recentGameURLs,
-                favoriteURLs: profile.favoriteGameURLs,
-                diagnosticsMessage: diagnosticsMessage,
-                openCurrent: {
-                    openURLTextInCurrentProfile(profile)
-                },
-                launchSelected: {
-                    Task {
-                        await launchURLTextForSelectedProfiles()
-                    }
-                },
-                repairAll: {
-                    Task {
-                        await launcher.repairAll(store.profiles, store: store)
-                    }
-                },
-                stopAll: {
-                    launcher.stopAll(store.profiles)
-                },
-                arrange: {
-                    launcher.arrangeWindows(for: store.profiles, layout: layout)
-                },
-                exportDiagnostics: {
-                    exportDiagnostics()
-                },
-                chooseURL: { url in
-                    launcherURLText = url
-                    openURLTextInCurrentProfile(profile)
-                },
-                addFavorite: {
-                    store.addFavoriteURL(launcherURLText, to: profile)
-                },
-                removeFavorite: { url in
-                    store.removeFavoriteURL(url, from: profile)
+                Picker("Color", selection: profileBinding(profile.id, \.colorName, fallback: profile.colorName)) {
+                    ForEach(ProfileColor.all) { color in Text(color.id.capitalized).tag(color.id) }
                 }
-            )
-
-            ProfileInspector(
-                profile: profile,
-                health: launcher.cloneHealth(for: profile),
-                setNotes: { store.setNotes(id: profile.id, notes: $0) },
-                clearSession: {
-                    Task {
-                        await launcher.clearSession(for: profile)
-                        webViewCache.removeWebView(for: profile)
-                        requestedURLs[profile.id] = URL(string: "https://www.roblox.com/")
-                    }
+                Text("Notes").font(.caption).foregroundStyle(.secondary)
+                TextEditor(text: profileBinding(profile.id, \.notes, fallback: profile.notes)).frame(minHeight: 90)
+                Button("Duplicate profile") { store.duplicate(profile) }
+            }
+            Section("Roblox copy") {
+                if let health = launcher.cloneHealth(for: profile) {
+                    LabeledContent("Installed", value: health.sourceVersion ?? "Not installed")
+                    LabeledContent("Profile", value: health.cloneVersion ?? "Not prepared")
+                    Text(health.summary).font(.caption).foregroundStyle(.secondary)
+                } else { Text("Checking Roblox…").foregroundStyle(.secondary) }
+                Button(launcher.status(for: profile) == .missingClone ? "Set up Roblox" : "Repair Roblox copy") {
+                    Task { await launcher.ensureClone(for: profile, store: store) }
+                }.disabled(launcher.isBusy(profile) || launcher.status(for: profile) == .running)
+                Button("Refresh health") { Task { await launcher.refresh(store.profiles, verify: true) } }
+                Button("Reveal files") { launcher.revealFiles(for: profile) }
+            }
+            Section("Saved data") {
+                Button("Clear session…", role: .destructive) { clearingProfile = profile }
+                    .disabled(launcher.isBusy(profile))
+                Button("Delete profile…", role: .destructive) { deletingProfile = profile }
+                    .disabled(launcher.isBusy(profile) || launcher.status(for: profile) == .running)
+                if launcher.status(for: profile) == .running {
+                    Text("Stop Roblox before repairing or deleting this profile.").font(.caption).foregroundStyle(.secondary)
                 }
-            )
-        }
-        .padding(12)
+            }
+        }.formStyle(.grouped)
     }
 
+    private var recoveryView: some View {
+        ContentUnavailableView {
+            Label("Your profiles need recovery", systemImage: "externaldrive.badge.exclamationmark")
+        } description: {
+            Text(store.errorMessage ?? "The saved profiles could not be read.")
+            Text("The original file will be kept when you restore a backup or start fresh.")
+        } actions: {
+            Button("Restore backup") { store.recoverFromBackup() }.disabled(!store.canRestoreBackup)
+            Button("Show saved files") { NSWorkspace.shared.open(store.rootDirectory) }
+            Button("Start fresh") { store.startFreshAfterRecovery() }
+        }
+    }
+
+    private func profileBinding(_ id: UUID, _ keyPath: WritableKeyPath<RobloxProfile, String>, fallback: String) -> Binding<String> {
+        Binding(get: { store.profiles.first { $0.id == id }?[keyPath: keyPath] ?? fallback },
+                set: { value in store.update(id: id) { $0[keyPath: keyPath] = value } })
+    }
     private var filteredProfiles: [RobloxProfile] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return store.profiles }
-        return store.profiles.filter {
-            $0.name.localizedCaseInsensitiveContains(query) ||
-                $0.notes.localizedCaseInsensitiveContains(query)
+        return query.isEmpty ? store.profiles : store.profiles.filter {
+            $0.name.localizedCaseInsensitiveContains(query) || $0.notes.localizedCaseInsensitiveContains(query)
         }
     }
+    private var selectedBulkProfiles: [RobloxProfile] { store.profiles.filter(\.isSelectedForBulkLaunch) }
 
-    private var selectedBulkProfiles: [RobloxProfile] {
-        store.profiles.filter(\.isSelectedForBulkLaunch)
-    }
-
-    private var errorBinding: Binding<Bool> {
-        Binding(
-            get: { store.errorMessage != nil },
-            set: { if !$0 { store.errorMessage = nil } }
-        )
-    }
-
-    private func currentProfile(_ id: UUID) -> RobloxProfile? {
-        store.profiles.first { $0.id == id }
-    }
-
-    private func parsedLauncherURL() -> URL? {
-        let trimmed = launcherURLText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        if let url = URL(string: trimmed), url.scheme != nil {
-            return url
+    private func parsedURL() -> URL? {
+        guard let url = LaunchURL.parse(launcherURLText) else {
+            diagnosticsMessage = "Enter a game URL or search text. Supported links use https, http, roblox, or roblox-player."
+            return nil
         }
-        return URL(string: "https://www.roblox.com/search?keyword=\(trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? trimmed)")
+        diagnosticsMessage = ""
+        return url
     }
-
-    private func openURLTextInCurrentProfile(_ profile: RobloxProfile) {
-        guard let url = parsedLauncherURL() else { return }
-        requestedURLs[profile.id] = url
-        store.recordRecentURL(url.absoluteString, for: profile)
-    }
-
-    private func launchURLTextForSelectedProfiles() async {
-        guard let url = parsedLauncherURL() else { return }
-
-        if url.scheme == "roblox" || url.scheme == "roblox-player" {
-            for profile in selectedBulkProfiles {
-                store.recordRecentURL(url.absoluteString, for: profile)
-            }
-            await launcher.launch(url, for: selectedBulkProfiles, store: store)
+    private func openCurrent(_ profile: RobloxProfile) {
+        guard !launcher.isBusy(profile), let url = parsedURL() else { return }
+        if LaunchURL.isNative(url) {
+            Task { await launcher.launch(url, for: profile, store: store) }
         } else {
-            for profile in selectedBulkProfiles {
-                requestedURLs[profile.id] = url
+            webViewCache.navigate(url, for: profile)
+            store.recordRecentURL(url.absoluteString, for: profile)
+        }
+    }
+    private func launchSelected() async {
+        guard let url = parsedURL() else { return }
+        let profiles = selectedBulkProfiles
+        if LaunchURL.isNative(url) {
+            await launcher.launch(url, for: profiles, store: store)
+        } else {
+            for profile in profiles {
+                webViewCache.navigate(url, for: profile)
                 store.recordRecentURL(url.absoluteString, for: profile)
             }
-            diagnosticsMessage = "Web URLs were queued into selected profile browsers. Select each profile and press Play from its logged-in Roblox page."
+            diagnosticsMessage = "Game pages opened for \(profiles.count) profiles. Select each profile and press Play using its saved login."
         }
     }
 
-    private func exportDiagnostics() {
+    private func exportDiagnostics() async {
+        await launcher.refresh(store.profiles, verify: true)
         let lines = store.profiles.map { profile in
-            let status = launcher.status(for: profile)
-            let health = launcher.cloneHealth(for: profile, forceRefresh: true)
-            let metric = launcher.metrics[profile.id]
-            return """
+            """
             Profile: \(profile.name)
-            ID: \(profile.id.uuidString)
-            Status: \(status.label)
-            Source version: \(health.sourceVersion ?? "unknown")
-            Clone version: \(health.cloneVersion ?? "unknown")
-            Bundle ID: \(health.bundleIdentifier ?? "unknown")
-            Health: \(health.summary)
-            Process: \(metric.map { "\($0.processID), CPU \($0.cpuPercent)%, RAM \(Int($0.memoryMB)) MB" } ?? "not running")
+            ID: \(profile.id)
+            Status: \(launcher.status(for: profile).label)
+            Source version: \(launcher.sourceVersion() ?? "unknown")
+            Clone version: \(launcher.cloneHealth(for: profile)?.cloneVersion ?? "unknown")
+            Health: \(launcher.cloneHealth(for: profile)?.summary ?? "not checked")
+            Bundle ID: \(launcher.cloneHealth(for: profile)?.bundleIdentifier ?? "unknown")
+            Process: \(launcher.metrics[profile.id].map { "\($0.processID), CPU \($0.cpuPercent)%, RAM \(Int($0.memoryMB)) MB" } ?? "not running")
+            Message: \(launcher.messages[profile.id] ?? "none")
             Clone path: \(profile.clonePath)
             """
         }
-
-        let text = """
-        MultiInstanceRoblox Diagnostics
-        Generated: \(Date())
-        Roblox source: /Applications/Roblox.app
-        Source version: \(launcher.sourceVersion() ?? "unknown")
-
-        \(lines.joined(separator: "\n\n"))
-        """
-
-        let outputURL = store.rootDirectory.appendingPathComponent("diagnostics.txt")
+        let text = "MultiInstanceRoblox diagnostics\nGenerated: \(Date())\n\n" + lines.joined(separator: "\n\n")
+        let output = store.rootDirectory.appendingPathComponent("diagnostics.txt")
         do {
-            try FileManager.default.createDirectory(at: store.rootDirectory, withIntermediateDirectories: true)
-            try text.write(to: outputURL, atomically: true, encoding: .utf8)
-            diagnosticsMessage = "Diagnostics exported to \(outputURL.path)"
-            NSWorkspace.shared.activateFileViewerSelecting([outputURL])
-        } catch {
-            diagnosticsMessage = "Could not export diagnostics: \(error.localizedDescription)"
-        }
+            try await Task.detached(priority: .utility) { try text.write(to: output, atomically: true, encoding: .utf8) }.value
+            diagnosticsMessage = "Diagnostics exported."
+            NSWorkspace.shared.activateFileViewerSelecting([output])
+        } catch { diagnosticsMessage = "Could not export diagnostics: \(error.localizedDescription)" }
     }
 }
 
+private struct BrowserPane: View {
+    @EnvironmentObject private var cache: RobloxWebViewCache
+    let profile: RobloxProfile
+    @ObservedObject var state: BrowserState
+    let launch: (URL) -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Button("Back", systemImage: "chevron.left") { cache.goBack(for: profile) }.disabled(!state.canGoBack)
+                Button("Forward", systemImage: "chevron.right") { cache.goForward(for: profile) }.disabled(!state.canGoForward)
+                Button("Reload", systemImage: "arrow.clockwise") { cache.reload(for: profile) }
+                Button("Home", systemImage: "house") { cache.reloadHome(for: profile) }
+                Divider().frame(height: 16)
+                Text(state.pageTitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Spacer()
+                if state.isLoading { ProgressView().controlSize(.small) }
+            }
+            .labelStyle(.iconOnly).buttonStyle(.borderless).padding(.horizontal, 12).padding(.vertical, 8)
+            if let error = state.errorMessage {
+                HStack {
+                    Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+                    Text(error).font(.caption).textSelection(.enabled)
+                    Spacer()
+                    Button("Retry") { cache.reload(for: profile) }
+                }.padding(10).background(.quaternary)
+            }
+            RobloxWebView(profile: profile, onLaunchURL: launch)
+        }
+    }
+}
 private struct ProfileRow: View {
     let profile: RobloxProfile
     let status: ProfileStatus
@@ -353,196 +394,6 @@ private struct ProfileRow: View {
     }
 }
 
-private struct ProfileHeader: View {
-    let profile: RobloxProfile
-    let status: ProfileStatus
-    let message: String?
-    let metric: RunningMetric?
-    let rename: (String) -> Void
-    let setColor: (String) -> Void
-    let setSymbol: (String) -> Void
-    let repair: () -> Void
-    let stop: () -> Void
-    let reveal: () -> Void
-
-    @State private var editedName: String = ""
-
-    var body: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 12) {
-                TextField("Profile name", text: $editedName)
-                    .onSubmit {
-                        rename(editedName)
-                    }
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 220)
-                .onAppear {
-                    editedName = profile.name
-                }
-                .onChange(of: profile.id) {
-                    editedName = profile.name
-                }
-
-                Picker("Icon", selection: Binding(
-                    get: { profile.symbolName },
-                    set: { setSymbol($0) }
-                )) {
-                    ForEach(ProfileIcon.symbols, id: \.self) { symbol in
-                        Label(symbol, systemImage: symbol).tag(symbol)
-                    }
-                }
-                .frame(width: 150)
-
-                Picker("Color", selection: Binding(
-                    get: { profile.colorName },
-                    set: { setColor($0) }
-                )) {
-                    ForEach(ProfileColor.all) { color in
-                        Text(color.id.capitalized).tag(color.id)
-                    }
-                }
-                .frame(width: 130)
-
-                StatusBadge(status: status)
-
-                if let metric {
-                    Text("CPU \(metric.cpuPercent, specifier: "%.1f")%  RAM \(Int(metric.memoryMB)) MB")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Button(action: repair) {
-                    Label(repairTitle, systemImage: "wrench.and.screwdriver")
-                }
-
-                Button(action: stop) {
-                    Label("Stop", systemImage: "stop.fill")
-                }
-                .disabled(!isRunning)
-
-                Button(action: reveal) {
-                    Label("Files", systemImage: "folder")
-                }
-            }
-
-            if let message, !message.isEmpty {
-                HStack {
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                    Spacer()
-                }
-            }
-        }
-    }
-
-    private var repairTitle: String {
-        switch status {
-        case .missingClone:
-            "Set Up"
-        case .staleClone:
-            "Repair"
-        default:
-            "Repair"
-        }
-    }
-
-    private var isRunning: Bool {
-        if case .running = status {
-            true
-        } else {
-            false
-        }
-    }
-}
-
-private struct LauncherPanel: View {
-    @Binding var urlText: String
-    @Binding var layout: WindowLayout
-    let selectedCount: Int
-    let recentURLs: [String]
-    let favoriteURLs: [String]
-    let diagnosticsMessage: String
-    let openCurrent: () -> Void
-    let launchSelected: () -> Void
-    let repairAll: () -> Void
-    let stopAll: () -> Void
-    let arrange: () -> Void
-    let exportDiagnostics: () -> Void
-    let chooseURL: (String) -> Void
-    let addFavorite: () -> Void
-    let removeFavorite: (String) -> Void
-
-    var body: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 8) {
-                TextField("Roblox game URL, private-server URL, roblox-player URL, or search text", text: $urlText)
-                    .textFieldStyle(.roundedBorder)
-
-                Button(action: openCurrent) {
-                    Label("Open", systemImage: "safari")
-                }
-
-                Button(action: launchSelected) {
-                    Label("Launch \(selectedCount)", systemImage: "play.fill")
-                }
-                .disabled(selectedCount == 0)
-
-                Button(action: addFavorite) {
-                    Image(systemName: "star")
-                }
-                .help("Add current URL to favorites")
-            }
-
-            HStack(spacing: 8) {
-                Button(action: repairAll) {
-                    Label("Repair All", systemImage: "arrow.triangle.2.circlepath")
-                }
-
-                Button(action: stopAll) {
-                    Label("Stop All", systemImage: "stop.circle")
-                }
-
-                Picker("Layout", selection: $layout) {
-                    ForEach(WindowLayout.allCases) { layout in
-                        Text(layout.label).tag(layout)
-                    }
-                }
-                .frame(width: 150)
-
-                Button(action: arrange) {
-                    Label("Arrange", systemImage: "rectangle.3.group")
-                }
-
-                Button(action: exportDiagnostics) {
-                    Label("Export Diagnostics", systemImage: "doc.text.magnifyingglass")
-                }
-
-                Spacer()
-            }
-
-            if !favoriteURLs.isEmpty || !recentURLs.isEmpty {
-                HStack(alignment: .top, spacing: 18) {
-                    URLList(title: "Favorites", urls: favoriteURLs, choose: chooseURL, remove: removeFavorite)
-                    URLList(title: "Recent", urls: recentURLs, choose: chooseURL, remove: nil)
-                }
-            }
-
-            if !diagnosticsMessage.isEmpty {
-                HStack {
-                    Text(diagnosticsMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                    Spacer()
-                }
-            }
-        }
-    }
-}
 
 private struct URLList: View {
     let title: String
@@ -595,54 +446,6 @@ private struct URLList: View {
     }
 }
 
-private struct ProfileInspector: View {
-    let profile: RobloxProfile
-    let health: CloneHealth
-    let setNotes: (String) -> Void
-    let clearSession: () -> Void
-
-    @State private var notes = ""
-
-    var body: some View {
-        DisclosureGroup {
-            HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Installed Roblox: \(health.sourceVersion ?? "unknown")")
-                    Text("Profile Roblox: \(health.cloneVersion ?? "not built")")
-                    Text("Bundle: \(health.bundleIdentifier ?? "not built")")
-                    Text("Health: \(health.summary)")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(minWidth: 320, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Notes")
-                        .font(.caption.weight(.semibold))
-                    TextEditor(text: $notes)
-                        .frame(height: 58)
-                        .onAppear {
-                            notes = profile.notes
-                        }
-                        .onChange(of: profile.id) {
-                            notes = profile.notes
-                        }
-                        .onChange(of: notes) {
-                            setNotes(notes)
-                        }
-                }
-
-                Button(role: .destructive, action: clearSession) {
-                    Label("Clear Session", systemImage: "eraser")
-                }
-            }
-            .padding(.top, 8)
-        } label: {
-            Label("Profile Details", systemImage: "info.circle")
-                .font(.caption.weight(.semibold))
-        }
-    }
-}
 
 private struct StatusBadge: View {
     let status: ProfileStatus
